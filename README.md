@@ -128,6 +128,11 @@ Wired in early. Without traces it was impossible to know whether a bad answer ca
 
 - [`examples/rag_pipeline.py`](examples/rag_pipeline.py) — LangGraph 5-stage state machine, multi-query, parent retriever, double-rerank
 
+## Photos
+
+- [`photos/azeus-office.jpeg`](photos/azeus-office.jpeg) — at the Azeus Systems office during the internship
+- [`photos/azeus-team.jpeg`](photos/azeus-team.jpeg) — with the Azeus internship team
+
 ## About me
 
 Built by **Wince Dela Fuente**.

@@ -34,3 +34,7 @@ chroma_db/
 
 # Logs
 *.log
+
+
+# claude-mem auto-generated context
+**/CLAUDE.md

@@ -1,64 +1,132 @@
-# RGBW Chatbot
+# RGBW Chatbot — Production Multi-RAG System
 
-A RAG-based chatbot built during my Software Developer Internship at Azeus Systems (June – July 2024). Combines structured (SQL) and unstructured (vector) document retrieval to answer questions over an enterprise document corpus.
+A production retrieval-augmented chatbot I built during my Software Developer Internship at Azeus Systems (June – July 2024). Answers domain-specific queries over message threads, crawled web pages, and Google Drive documents using a 5-stage multi-query retrieval pipeline orchestrated in LangGraph.
 
-> **Note:** This repository is portfolio documentation of work completed during my internship. The full production code lives in Azeus's private infrastructure. The architecture, decisions, and representative code shown here are based on what I built.
+> **Note:** This repository is portfolio documentation of work completed during my internship. The full production code lives in Azeus Systems's private infrastructure. The architecture, retrieval pipeline, and representative code shown here are based on what I designed and built.
 
 ## Problem
 
-The internal team needed a chatbot that could answer questions across two different document types:
+The internal team needed a chatbot that could autonomously answer domain-specific questions over a heterogeneous corpus:
 
-1. **Structured records** stored in Supabase Postgres (IDs, names, fields with exact-match semantics)
-2. **Unstructured documents** (PDFs, internal notes) where semantic similarity beats exact-match
+- **Crawled web pages** (with breadcrumb hierarchy)
+- **Google Drive documents** (with folder/group hierarchy)
+- **Message threads** (long, multi-author, partially-structured)
 
-A single retriever wouldn't work — SQL beats embeddings on structured data; embeddings beat keyword search on unstructured text. The chatbot needed both, with the LLM agent deciding which tool to call per query.
+Off-the-shelf "stuff-the-PDFs-into-Chroma" RAG produced poor answers because:
+
+1. Chunks lost their **context** (a paragraph from a "Pricing" page reads identically to a paragraph from a "Refunds" page once embedded)
+2. Naive top-k retrieval missed relevant chunks when the user's phrasing didn't lexically match the source
+3. Small chunks gave precise retrieval but lacked context for synthesis; large chunks gave context but blew the relevance ranking
+
+The system needed multi-stage retrieval, multi-query expansion, hierarchical (parent/child) chunking, reranking, and stateful orchestration.
 
 ## Architecture
 
 ```
-User query
+User question
     ↓
-LangChain agent (GROQ Llama 3 70B)
+LangGraph orchestrator (state machine)
     ↓
-Tool routing
-    ├── Supabase SQLDocStore  → structured queries
-    └── ChromaDB              → semantic similarity (top-k)
-        ↓
-    retrieved context
+┌─ Stage 1: Multi-query expansion ─────────────────────────────┐
+│  Fast model (GPT-3.5 / Haiku) generates 1 paraphrase         │
+│  → 2 queries total: original + paraphrase                    │
+└──────────────────────────────────────────────────────────────┘
     ↓
-LLM synthesis grounded in retrieved chunks
+┌─ Stage 2: Child-chunk retrieval (per query, x2) ─────────────┐
+│  Chroma similarity search → top 200 small child chunks       │
+│  (200–250 chars each, with up to 100-char context header)    │
+└──────────────────────────────────────────────────────────────┘
     ↓
-Response
+┌─ Stage 3: First rerank ──────────────────────────────────────┐
+│  Rerank 200 child chunks per query                           │
+│  Drop < 0.1 relevance score → keep up to 150 per query       │
+└──────────────────────────────────────────────────────────────┘
+    ↓
+┌─ Stage 4: Parent expansion ──────────────────────────────────┐
+│  Map child chunks → parent chunks (up to 2500 chars)         │
+│  Up to 20 parents per query → ~40 parents across 2 queries   │
+└──────────────────────────────────────────────────────────────┘
+    ↓
+┌─ Stage 5: Second rerank + LLM synthesis ─────────────────────┐
+│  Rerank 40 parent docs against ORIGINAL question             │
+│  Keep top 30 with score ≥ 0.1                                │
+│  Send to GPT-4-turbo or Claude Sonnet for final answer       │
+└──────────────────────────────────────────────────────────────┘
+    ↓
+Grounded response (3K–12K tokens of context, ~1–2¢ per query)
 ```
 
 ## Tech stack
 
-- **Orchestration:** LangChain (chains + agents + tool routing)
-- **LLM:** GROQ-hosted Llama 3 70B
-- **Structured store:** Supabase (Postgres) via `SQLDocStore` adapter
-- **Vector store:** ChromaDB (persisted locally)
-- **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2`
+- **Orchestration:** LangGraph (5-stage state machine)
+- **Retrieval framework:** LangChain (multi-query, parent-document, reranking)
+- **Vector store:** ChromaDB
+- **Source-of-truth doc store:** Supabase Postgres via a **custom LangChain library extension** I wrote — stores vector embeddings directly in an SQLDocStore on Supabase, so embeddings + structured records share one transactional DB
+- **Main LLM:** GPT-4-turbo or Claude 3 Sonnet (for final synthesis)
+- **Fast LLM:** GPT-3.5-turbo or Claude 3 Haiku (for multi-query expansion — cheaper, faster, quality doesn't matter much for paraphrasing)
+- **Observability:** LangSmith (trace inspection, agent performance tracking, evaluation)
+- **GUI:** Streamlit (internal tool for non-engineers to run data ingestion + test RAG queries)
 - **Language:** Python 3.11
 
-## Key decisions
+## Key design decisions
 
-**Why GROQ over OpenAI?** Latency. GROQ's LPU inference delivered roughly 10x faster token throughput than OpenAI's GPT-3.5 at the time, at lower cost — important for chat where perceived speed is the experience.
+### 1. Contextual headers on every chunk (the single biggest retrieval-quality win)
 
-**Why split SQLDocStore + Chroma?** A pure vector store ranked structured fields poorly (exact ID lookups returned semantically-similar-but-wrong records). The split let the agent pick the right tool per query: SQL for "give me record #4521", vector search for "find documents about X".
+Every child and parent chunk carries a 50–100 char context header prepended before embedding:
 
-**Why all-MiniLM-L6-v2 embeddings?** ~80MB model, fast inference on CPU, good-enough quality for English business docs. We didn't need OpenAI ada-002 cost at the prototype stage.
+- For GDrive: `{folder_group} / {document_name}` (e.g., `"Engineering / Sprint Notes / 2024-Q2 retros"`)
+- For web crawls: breadcrumb path (e.g., `"Docs / API / Authentication / OAuth Flow"`)
 
-**Why an agent, not a pipeline?** Some queries needed both stores (e.g., "summarize the documents linked to project ID 4521"). A hard-coded pipeline would have forced one retrieval; the agent could chain SQL → vector → synthesis dynamically.
+Without headers, "the new pricing tier launched" embeds identically whether it's from the Pricing page or a buried discussion thread. With headers, retrieval distinguishes them and the LLM gets cleaner signal.
+
+### 2. Markdown-aware splitting (not naive char-count chunking)
+
+All sources are converted to Markdown first (HTML→MD for web, Google Docs export for GDrive). Then `MarkdownTextSplitter` cuts on heading boundaries first, then on character limits within sections. Result: chunks rarely cross a semantic boundary mid-thought.
+
+### 3. Parent/child chunk hierarchy
+
+- **Child:** 200–250 chars + ~100 char header. Small enough for precise similarity matching.
+- **Parent:** up to 2500 chars + same header. Big enough for LLM to synthesize an answer with surrounding context.
+
+Retrieval happens at the child level (precision); the LLM sees the parent level (context).
+
+### 4. Multi-query expansion
+
+A single user query has one phrasing bias. We generate a second paraphrase with a cheap model and retrieve for both. This recovers chunks that the original phrasing missed.
+
+### 5. Two-stage reranking
+
+- First rerank: after child retrieval, against the same query that fetched them — drops irrelevant noise before parent expansion
+- Second rerank: after parent expansion, against the **original** question only — multi-query paraphrases helped retrieve, but we don't want them confusing the final synthesis ranking
+
+### 6. Cost-aware model tiering
+
+- Fast/cheap model for query expansion (no quality bar — just need a different phrasing)
+- Premium model for synthesis (quality is the user-visible output)
+
+Typical query: 3K–12K tokens of context to the synthesis model. With Claude Sonnet that's about **1–2¢ per answer**. Acceptable for internal use.
+
+### 7. Custom Supabase SQLDocStore extension
+
+I extended LangChain's `BaseStore` interface to persist vector embeddings into a `documents` table on Supabase Postgres alongside the structured metadata, instead of in a separate Chroma directory. This let the team:
+
+- Run a single backup pipeline
+- Query embeddings + structured fields in one SQL statement
+- Reuse Supabase row-level security for tenant isolation
+
+### 8. LangSmith for evaluation, not just debugging
+
+Wired in early. Without traces it was impossible to know whether a bad answer came from bad retrieval, bad reranking, or bad synthesis. With LangSmith I could click any answer and see all 5 stages' inputs and outputs.
 
 ## Outcomes
 
-- Demoed end-to-end to the internal team within the 6-week internship window
-- Established the RAG + dual-retriever pattern the team continued building on after I left
-- Documented the tool-routing approach for the team's later production work
+- Production RAG system delivered end-to-end within the 6-week internship
+- Presented the completed system to internal stakeholders
+- Custom Supabase SQLDocStore extension and the 5-stage pipeline pattern continued in use after the internship
 
 ## Representative code
 
-See [`examples/rag_chain.py`](examples/rag_chain.py) for the LangChain agent + dual-tool wiring pattern.
+- [`examples/rag_pipeline.py`](examples/rag_pipeline.py) — LangGraph 5-stage state machine, multi-query, parent retriever, double-rerank
 
 ## About me
 

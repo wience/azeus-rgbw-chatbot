@@ -4,19 +4,22 @@ This is portfolio documentation of the multi-query, parent-retriever,
 double-rerank pattern I built at Azeus Systems. Production code is
 private; this captures the architecture.
 
+Scope: this file represents the downstream RAG pipeline I owned. The
+upstream Redmine parsing + training-data prep was handled by a teammate
+and is not represented here.
+
 No Groq, no Llama 3. Main synthesis runs on Claude 3 Sonnet or
 GPT-4-turbo; query expansion runs on Claude 3 Haiku or GPT-3.5-turbo.
 
 Run requires:
     pip install langgraph langchain langchain-community langchain-anthropic \
-                langchain-openai chromadb cohere supabase
+                langchain-openai chromadb cohere psycopg
 
 Env vars:
     ANTHROPIC_API_KEY
     OPENAI_API_KEY
     COHERE_API_KEY        # for reranking
-    SUPABASE_URL
-    SUPABASE_KEY
+    POSTGRES_DSN          # for the custom SQLDocStore extension
 """
 
 from __future__ import annotations
@@ -51,7 +54,8 @@ CHILD_STORE = Chroma(
 )
 
 # Parent store — up to 2500 char chunks, keyed by parent_id
-# In production this lived in Supabase via my custom SQLDocStore extension;
+# In production this lived in Postgres via my custom SQLDocStore extension
+# (one transactional store for both embeddings and chunk metadata);
 # stubbed here as an in-memory map.
 PARENT_STORE: dict[str, Document] = {}
 

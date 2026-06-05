@@ -1,20 +1,23 @@
 # RGBW Chatbot — Production Multi-RAG System
 
-A production retrieval-augmented chatbot I built during my Software Developer Internship at Azeus Systems (June – July 2024). Answers domain-specific queries over message threads, crawled web pages, and Google Drive documents using a 5-stage multi-query retrieval pipeline orchestrated in LangGraph.
+A production retrieval-augmented chatbot I built during my Software Developer Internship at Azeus Systems (June – July 2024). Answers domain-specific queries over the team's **Redmine** issue and discussion threads using a 5-stage multi-query retrieval pipeline orchestrated in LangGraph.
 
 > **Note:** This repository is portfolio documentation of work completed during my internship. The full production code lives in Azeus Systems's private infrastructure. The architecture, retrieval pipeline, and representative code shown here are based on what I designed and built.
 
+## Scope and credits
+
+The full system had two parts. I want to be precise about which I owned:
+
+- **Upstream — data ingestion (teammate-owned).** A teammate handled parsing Redmine issue threads and producing cleaned training/embedding-ready data. I did not write that code.
+- **Downstream — RAG pipeline (mine).** Everything covered in this README: 5-stage retrieval design, LangGraph orchestration, multi-query expansion, parent/child chunking strategy, double-rerank, custom SQLDocStore extension for embedding storage, LangSmith tracing, and the Streamlit GUI.
+
 ## Problem
 
-The internal team needed a chatbot that could autonomously answer domain-specific questions over a heterogeneous corpus:
+The internal team needed a chatbot that could autonomously answer domain-specific questions over the team's Redmine corpus — issue threads, comment chains, and project discussions. Redmine threads are long, multi-author, partially-structured (status, tracker, priority fields surround free-form discussion), and rich with the institutional knowledge the team wanted on tap.
 
-- **Crawled web pages** (with breadcrumb hierarchy)
-- **Google Drive documents** (with folder/group hierarchy)
-- **Message threads** (long, multi-author, partially-structured)
+Off-the-shelf "stuff-the-text-into-Chroma" RAG produced poor answers because:
 
-Off-the-shelf "stuff-the-PDFs-into-Chroma" RAG produced poor answers because:
-
-1. Chunks lost their **context** (a paragraph from a "Pricing" page reads identically to a paragraph from a "Refunds" page once embedded)
+1. Chunks lost their **context** (a comment from a "Refunds" tracker reads identically to a comment from a "Pricing" tracker once embedded)
 2. Naive top-k retrieval missed relevant chunks when the user's phrasing didn't lexically match the source
 3. Small chunks gave precise retrieval but lacked context for synthesis; large chunks gave context but blew the relevance ranking
 
@@ -58,10 +61,11 @@ Grounded response (3K–12K tokens of context, ~1–2¢ per query)
 
 ## Tech stack
 
+- **Source corpus:** Redmine (issue + comment threads from the team's project tracker)
 - **Orchestration:** LangGraph (5-stage state machine)
 - **Retrieval framework:** LangChain (multi-query, parent-document, reranking)
-- **Vector store:** ChromaDB
-- **Source-of-truth doc store:** Supabase Postgres via a **custom LangChain library extension** I wrote — stores vector embeddings directly in an SQLDocStore on Supabase, so embeddings + structured records share one transactional DB
+- **Vector store:** ChromaDB (child-chunk similarity search)
+- **Embedding storage:** Postgres-backed `SQLDocStore` via a **custom LangChain library extension** I authored — persists vector embeddings + chunk metadata in one transactional store rather than a separate Chroma directory, simplifying backups and tenant isolation
 - **Main LLM:** GPT-4-turbo or Claude 3 Sonnet (for final synthesis)
 - **Fast LLM:** GPT-3.5-turbo or Claude 3 Haiku (for multi-query expansion — cheaper, faster, quality doesn't matter much for paraphrasing)
 - **Observability:** LangSmith (trace inspection, agent performance tracking, evaluation)
@@ -72,16 +76,15 @@ Grounded response (3K–12K tokens of context, ~1–2¢ per query)
 
 ### 1. Contextual headers on every chunk (the single biggest retrieval-quality win)
 
-Every child and parent chunk carries a 50–100 char context header prepended before embedding:
+Every child and parent chunk carries a 50–100 char context header prepended before embedding. For Redmine threads, the header is the natural hierarchy:
 
-- For GDrive: `{folder_group} / {document_name}` (e.g., `"Engineering / Sprint Notes / 2024-Q2 retros"`)
-- For web crawls: breadcrumb path (e.g., `"Docs / API / Authentication / OAuth Flow"`)
+`{project} / {tracker} / {issue_title}` — e.g., `"Customer Portal / Bug / Login fails after password reset"`
 
-Without headers, "the new pricing tier launched" embeds identically whether it's from the Pricing page or a buried discussion thread. With headers, retrieval distinguishes them and the LLM gets cleaner signal.
+Without headers, "we rolled it back after the staging test" embeds identically whether it's from a login-bug thread or an unrelated billing thread. With headers, retrieval distinguishes them and the LLM gets cleaner signal.
 
 ### 2. Markdown-aware splitting (not naive char-count chunking)
 
-All sources are converted to Markdown first (HTML→MD for web, Google Docs export for GDrive). Then `MarkdownTextSplitter` cuts on heading boundaries first, then on character limits within sections. Result: chunks rarely cross a semantic boundary mid-thought.
+Redmine descriptions and comments are Markdown-formatted. `MarkdownTextSplitter` cuts on heading and list boundaries first, then on character limits within sections. Result: chunks rarely cross a semantic boundary mid-thought.
 
 ### 3. Parent/child chunk hierarchy
 
@@ -106,13 +109,13 @@ A single user query has one phrasing bias. We generate a second paraphrase with 
 
 Typical query: 3K–12K tokens of context to the synthesis model. With Claude Sonnet that's about **1–2¢ per answer**. Acceptable for internal use.
 
-### 7. Custom Supabase SQLDocStore extension
+### 7. Custom SQLDocStore extension
 
-I extended LangChain's `BaseStore` interface to persist vector embeddings into a `documents` table on Supabase Postgres alongside the structured metadata, instead of in a separate Chroma directory. This let the team:
+I extended LangChain's `BaseStore` interface to persist vector embeddings into a `documents` table on Postgres alongside the structured chunk metadata, instead of in a separate Chroma persist directory. This let the team:
 
 - Run a single backup pipeline
 - Query embeddings + structured fields in one SQL statement
-- Reuse Supabase row-level security for tenant isolation
+- Reuse standard Postgres row-level controls for access scoping
 
 ### 8. LangSmith for evaluation, not just debugging
 
@@ -120,9 +123,9 @@ Wired in early. Without traces it was impossible to know whether a bad answer ca
 
 ## Outcomes
 
-- Production RAG system delivered end-to-end within the 6-week internship
+- Production RAG pipeline delivered end-to-end within the 6-week internship (downstream of teammate-owned Redmine ingestion)
 - Presented the completed system to internal stakeholders
-- Custom Supabase SQLDocStore extension and the 5-stage pipeline pattern continued in use after the internship
+- Custom Postgres SQLDocStore extension and the 5-stage retrieval pattern continued in use after the internship
 
 ## Representative code
 
